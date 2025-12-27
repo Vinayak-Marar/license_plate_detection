@@ -1,0 +1,16 @@
+easyocr==1.7.2
+ImageIO==2.37.2
+matplotlib==3.10.7
+mlflow==3.6.0
+numpy==2.2.6
+opencv-contrib-python==4.10.0.84
+opencv-python==4.12.0.88
+opencv-python-headless==4.10.0.84
+pandas==2.3.3
+pillow==12.0.0
+roboflow==1.2.11
+torch==2.5.1+cu121
+ultralytics==8.3.237
+ultralytics-thop==2.0.18
+PyYAML==6.0.2
+
