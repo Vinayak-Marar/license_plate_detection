@@ -1,198 +1,243 @@
 import cv2
 import os
-import numpy as np
-from ultralytics import YOLO
-from PIL import Image
+import re
+import sys
+import time
 import torch
-import time 
-import sys 
+import numpy as np
 import tkinter as tk
 from tkinter import filedialog
+from PIL import Image
+from ultralytics import YOLO
+import easyocr
 
-# -------------------------------
-# CONFIGURATION
-# -------------------------------
+# ===============================
+# CONFIG
+# ===============================
 MODEL_PATH = "best.pt"
 CONF_THRESHOLD = 0.8
-
-# FIX: Ensure DEVICE is a string
-DEVICE = str(0) if torch.cuda.is_available() else "cpu"
-
-# Optimization: Skip frames for faster detection processing
-# The fewer frames we process (higher FRAME_SKIP_RATE), the faster the detection FPS.
 FRAME_SKIP_RATE = 1
 
-print(f"🔥 Using device: {DEVICE.upper()}")
+DEVICE = "0" if torch.cuda.is_available() else "cpu"
+print(f"🔥 Using device: {DEVICE}")
 
-# -------------------------------
-# LOAD MODEL
-# -------------------------------
+# ===============================
+# LOAD MODELS
+# ===============================
 try:
     model = YOLO(MODEL_PATH)
 except Exception as e:
-    print(f"❌ Error loading model: {e}. Check if '{MODEL_PATH}' exists.")
+    print(f"❌ Failed to load YOLO model: {e}")
     sys.exit(1)
 
-# -------------------------------
-# FILE PICKER (Tkinter GUI)
-# -------------------------------
+reader = easyocr.Reader(['en'], gpu=torch.cuda.is_available())
+
+# ===============================
+# OCR HELPERS
+# ===============================
+def clean_text(text):
+    return re.sub(r'[^A-Z0-9]', '', text.upper())
+
+
+def license_complies_format(text):
+    if len(text) != 10:
+        return False
+
+    return (
+        text[0:2].isalpha() and
+        text[2:4].isdigit() and
+        text[4:6].isalpha() and
+        text[6:10].isdigit()
+    )
+
+
+def read_license_plate(crop_rgb):
+    detections = reader.readtext(crop_rgb)
+
+    if not detections:
+        return None
+
+    texts = [clean_text(t[1]) for t in detections]
+    texts = [t for t in texts if len(t) >= 8]
+
+    if not texts:
+        return None
+
+    best = max(texts, key=len)
+
+    if license_complies_format(best):
+        return best
+
+    return None
+
+
+# ===============================
+# FILE PICKER
+# ===============================
 def pick_file():
-    """Opens a GUI file dialog to select an image or video file."""
     root = tk.Tk()
-    root.withdraw()  
-    file_path = filedialog.askopenfilename(
-        title="Select image or video file for detection",
+    root.withdraw()
+    path = filedialog.askopenfilename(
+        title="Select image or video",
         filetypes=[
-            ("Media files", "*.jpg *.jpeg *.png *.mp4 *.avi *.mov"),
+            ("Media", "*.jpg *.jpeg *.png *.mp4 *.avi *.mov"),
             ("All files", "*.*")
         ]
     )
     root.destroy()
-    return file_path
+    return path
 
-# -------------------------------
-# IMAGE DETECTION (Static)
-# -------------------------------
-def detect_image(image_path):
-    """Performs detection on a single image and displays the result."""
-    try:
-        print(f"🖼️ Processing image: {image_path}")
-        image = Image.open(image_path).convert("RGB")
-        image_np = np.array(image)
 
-        results = model.predict(
-            image_np,
-            conf=CONF_THRESHOLD,
-            device=DEVICE,
-            verbose=False
-        )
+# ===============================
+# IMAGE DETECTION
+# ===============================
+def detect_image(path):
+    print(f"🖼️ Processing image: {path}")
 
-        annotated = results[0].plot()
+    image = Image.open(path).convert("RGB")
+    image_np = np.array(image)
 
-        annotated_bgr = cv2.cvtColor(annotated, cv2.COLOR_RGB2BGR)
+    results = model.predict(
+        image_np,
+        conf=CONF_THRESHOLD,
+        device=DEVICE,
+        verbose=False
+    )
 
-        cv2.imshow(
-            "YOLO Detection - Image (Press any key to close)",
-            annotated_bgr
-        )
-        cv2.waitKey(0)
-        cv2.destroyAllWindows()
-    except Exception as e:
-        print(f"❌ Error processing image: {e}")
+    annotated_rgb = results[0].plot()
 
-# -------------------------------
-# VIDEO DETECTION (True Real-Time Playback)
-# -------------------------------
-def detect_video(video_path):
-    """Plays video in real-time with detection results layered on top."""
-    cap = cv2.VideoCapture(video_path)
-    
+    if results[0].boxes is not None:
+        for box in results[0].boxes.xyxy:
+            x1, y1, x2, y2 = map(int, box)
+            h, w = image_np.shape[:2]
+            x1, x2 = max(0, x1), min(w, x2)
+            y1, y2 = max(0, y1), min(h, y2)
+
+            crop = image_np[y1:y2, x1:x2]
+            plate = read_license_plate(crop)
+
+            if plate:
+                print(f"[IMAGE] Plate detected: {plate}")
+                annotated_bgr = cv2.cvtColor(annotated_rgb, cv2.COLOR_RGB2BGR)
+                cv2.putText(
+                    annotated_bgr,
+                    plate,
+                    (x1, max(30, y1 - 10)),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    1,
+                    (0, 255, 0),
+                    2
+                )
+                annotated_rgb = cv2.cvtColor(annotated_bgr, cv2.COLOR_BGR2RGB)
+
+    cv2.imshow("Image Detection (Press any key)", cv2.cvtColor(annotated_rgb, cv2.COLOR_RGB2BGR))
+    cv2.waitKey(0)
+    cv2.destroyAllWindows()
+
+
+# ===============================
+# VIDEO DETECTION
+# ===============================
+def detect_video(path):
+    print(f"🎬 Processing video: {path}")
+
+    cap = cv2.VideoCapture(path)
     if not cap.isOpened():
-        print(f"❌ Could not open video file: {video_path}")
+        print("❌ Cannot open video")
         return
 
-    # --- 1. Get Video Properties & Calculate Playback Delay ---
-    original_fps = cap.get(cv2.CAP_PROP_FPS)
-    
-    # Calculate the required delay in milliseconds to achieve original FPS
-    # T_frame = (1 / FPS) * 1000. We cast to int for cv2.waitKey()
-    if original_fps > 0:
-        delay_ms = int(275 / original_fps)
-    else:
-        # Default to 30 FPS if information is missing
-        delay_ms = 33
-    
-    print(f"🎬 Playing video: {video_path}")
-    print(f"   Original FPS: {original_fps:.2f} (Delay: {delay_ms}ms). Detection Skip Rate: 1/{FRAME_SKIP_RATE}")
+    fps_src = cap.get(cv2.CAP_PROP_FPS)
+    delay = int(1000 / fps_src) if fps_src > 0 else 33
 
-    # --- Loop variables ---
-    frame_counter = 0
-    latest_annotated_frame = None 
-    start_time = time.time()
-    fps = 0.0 # Initialized
-    
+    frame_id = 0
+    latest_annotated = None
+    start = time.time()
+
     while cap.isOpened():
         ret, frame = cap.read()
         if not ret:
             break
 
-        frame_counter += 1
+        frame_id += 1
 
-        # ----------------------------------------------------
-        # OPTIMIZATION: FRAME SKIPPING FOR DETECTION SPEED
-        # ----------------------------------------------------
-        # Only run the heavy detection model every Nth frame
-        if frame_counter == 1 or frame_counter % FRAME_SKIP_RATE == 0:
-            # RUN DETECTION
+        if frame_id == 1 or frame_id % FRAME_SKIP_RATE == 0:
             results = model.predict(
                 frame,
                 conf=CONF_THRESHOLD,
                 device=DEVICE,
                 verbose=False
             )
-            # Store the latest annotated frame (RGB)
-            latest_annotated_frame = results[0].plot()
-        
-        # ----------------------------------------------------
-        # LAYER DETECTION RESULTS ON FRAME
-        # ----------------------------------------------------
-        # If we have a recent annotated frame, use it; otherwise, use the raw frame
-        if latest_annotated_frame is not None:
-            # CRITICAL: Convert RGB (YOLO output) to BGR (OpenCV format)
-            frame_to_display = cv2.cvtColor(latest_annotated_frame, cv2.COLOR_RGB2BGR)
+
+            annotated_rgb = results[0].plot()
+            annotated_bgr = cv2.cvtColor(annotated_rgb, cv2.COLOR_RGB2BGR)
+
+            if results[0].boxes is not None:
+                for box in results[0].boxes.xyxy:
+                    x1, y1, x2, y2 = map(int, box)
+                    h, w = frame.shape[:2]
+                    x1, x2 = max(0, x1), min(w, x2)
+                    y1, y2 = max(0, y1), min(h, y2)
+
+                    crop_rgb = cv2.cvtColor(frame[y1:y2, x1:x2], cv2.COLOR_BGR2RGB)
+                    plate = read_license_plate(crop_rgb)
+
+                    if plate:
+                        print(f"[VIDEO] Frame {frame_id} → {plate}")
+                        cv2.putText(
+                            annotated_bgr,
+                            plate,
+                            (x1, max(30, y1 - 10)),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.9,
+                            (0, 255, 0),
+                            2
+                        )
+
+            latest_annotated = annotated_bgr
+
+        if latest_annotated is not None:
+            display = latest_annotated
         else:
-            frame_to_display = frame 
+            display = frame
 
-        # ----------------------------------------------------
-        # FPS Calculation and Info Display
-        # ----------------------------------------------------
-        # Calculate detection/processing FPS
-        if frame_counter % 30 == 0:
-            # We calculate FPS based on how fast the loop runs to show *processing* speed
-            fps = 30 / (time.time() - start_time) 
-            start_time = time.time()
+        fps = 1 / max(1e-6, (time.time() - start))
+        start = time.time()
 
-        fps_text = f"Proc FPS: {fps:.1f} | Device: {DEVICE.upper()} | Skip: 1/{FRAME_SKIP_RATE}"
-        cv2.putText(frame_to_display, fps_text, (20, 50), 
-                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-
-        # ----------------------------------------------------
-        # DISPLAY AND DELAY FOR REAL-TIME PLAYBACK
-        # ----------------------------------------------------
-        cv2.imshow(
-            f"YOLO Detection - Real-Time Playback (Press Q to quit)",
-            frame_to_display
+        cv2.putText(
+            display,
+            f"FPS: {fps:.1f}",
+            (20, 40),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            1,
+            (0, 255, 0),
+            2
         )
 
-        # This waits for exactly 'delay_ms' milliseconds to enforce original video speed.
-        if cv2.waitKey(delay_ms) & 0xFF == ord("q"):
+        cv2.imshow("Video Detection (Press Q to quit)", display)
+
+        if cv2.waitKey(delay) & 0xFF == ord("q"):
             break
 
-    # --- Cleanup ---
     cap.release()
     cv2.destroyAllWindows()
-    print("✅ Video playback finished.")
+    print("✅ Video finished")
 
-# -------------------------------
-# MAIN EXECUTION (using Tkinter)
-# -------------------------------
+
+# ===============================
+# MAIN
+# ===============================
 if __name__ == "__main__":
-    
-    file_path = pick_file()
+    path = pick_file()
 
-    if not file_path:
-        print("❌ No file selected. Exiting.")
+    if not path:
+        print("❌ No file selected")
         sys.exit(0)
 
-    if not os.path.exists(file_path):
-        print(f"\n❌ ERROR: Selected file not found at path: {file_path}")
-        sys.exit(1)
-
-    ext = file_path.lower().split(".")[-1]
+    ext = path.lower().split(".")[-1]
 
     if ext in ["jpg", "jpeg", "png"]:
-        detect_image(file_path)
+        detect_image(path)
     elif ext in ["mp4", "avi", "mov"]:
-        detect_video(file_path)
+        detect_video(path)
     else:
-        print(f"❌ Unsupported file type: {ext}")
+        print("❌ Unsupported file type")
